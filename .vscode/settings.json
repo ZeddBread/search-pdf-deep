@@ -1,0 +1,7 @@
+{
+    "code-runner.executorMap": {
+        "python": "powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -Command \"python \\\"$file\\\"\""
+    },
+    "code-runner.runInTerminal": true,
+    "code-runner.executorMapByFileExtension": {}
+}
