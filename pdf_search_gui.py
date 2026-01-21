@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import logging
 import os
 import queue
 import threading
@@ -14,6 +15,9 @@ from tkinter import filedialog, messagebox, ttk
 import customtkinter as ctk
 
 from pdf_search_core import Match, Progress, search_pdfs
+
+# Shared app logger (configured by launcher; safe if it isn't)
+logger = logging.getLogger("pdf_search")
 
 # If OCR is enabled and Tesseract isn't on PATH, set this:
 # import pytesseract
@@ -317,6 +321,11 @@ class PDFSearchApp(ctk.CTk):
 
 def main() -> int:
     app = PDFSearchApp()
+    # This runs once the event loop is active and the window exists.
+    try:
+        app.after(0, lambda: logger.info("PDF Search GUI started (mainloop running)."))
+    except Exception:
+        pass
     app.mainloop()
     return 0
 
