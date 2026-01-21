@@ -4,7 +4,6 @@ import csv
 import logging
 import os
 import queue
-import threading
 import time
 from pathlib import Path
 from typing import Optional, List
@@ -14,7 +13,10 @@ from tkinter import filedialog, messagebox, ttk
 
 import customtkinter as ctk
 
-from pdf_search_core import Match, Progress, search_pdfs
+import multiprocessing as mp
+
+from pdf_search_core import Match
+from pdf_search_mp import search_worker
 from pdf_search_settings import Settings, load_settings, save_settings
 
 # Shared app logger (configured by launcher; safe if it isn't)
@@ -51,9 +53,9 @@ class PDFSearchApp(ctk.CTk):
         # Save on close
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self._worker: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-        self._ui_queue: "queue.Queue[tuple]" = queue.Queue()
+        self._proc: Optional[mp.Process] = None
+        self._mp_queue: Optional[mp.Queue] = None
+        self._cancel_event: Optional[mp.Event] = None
 
         self._results: List[Match] = []
 
@@ -209,6 +211,11 @@ class PDFSearchApp(ctk.CTk):
         try:
             self._save_settings_now()
         finally:
+            try:
+                self._cancel_search()
+                self._cleanup_process()
+            except Exception:
+                pass
             self.destroy()
 
     def _set_busy(self, busy: bool) -> None:
@@ -218,7 +225,7 @@ class PDFSearchApp(ctk.CTk):
         self.query_entry.configure(state="disabled" if busy else "normal")
 
     def _start_search(self) -> None:
-        if self._worker and self._worker.is_alive():
+        if self._proc and self._proc.is_alive():
             return
 
         folder = Path(self.folder_var.get()).expanduser()
@@ -238,81 +245,108 @@ class PDFSearchApp(ctk.CTk):
         self.status_var.set("Starting...")
         self.progress.set(0)
 
-        self._stop_event.clear()
         self._set_busy(True)
 
-        args = dict(
-            folder=folder,
-            query=query,
-            recursive=bool(self.recursive_var.get()),
-            use_regex=bool(self.regex_var.get()),
-            ignore_case=bool(self.ignore_case_var.get()),
-            include_ocr=bool(self.ocr_var.get()),
-            ocr_dpi=int(self.ocr_dpi_var.get() or 200),
-        )
+        # Multiprocessing setup
+        self._mp_queue = mp.Queue()
+        self._cancel_event = mp.Event()
 
-        self._worker = threading.Thread(target=self._worker_run, kwargs=args, daemon=True)
-        self._worker.start()
+        proc_args = {
+            "folder": str(folder.resolve()),
+            "query": query,
+            "recursive": bool(self.recursive_var.get()),
+            "use_regex": bool(self.regex_var.get()),
+            "ignore_case": bool(self.ignore_case_var.get()),
+            "include_ocr": bool(self.ocr_var.get()),
+            "ocr_dpi": int(self.ocr_dpi_var.get() or 200),
+            "snippet_radius": 70,
+        }
+
+        self._proc = mp.Process(
+            target=search_worker,
+            args=(proc_args, self._mp_queue, self._cancel_event),
+            daemon=True,
+        )
+        self._proc.start()
 
     def _cancel_search(self) -> None:
-        self._stop_event.set()
+        if self._cancel_event:
+            self._cancel_event.set()
         self.status_var.set("Cancelling...")
 
-    def _worker_run(self, **kwargs) -> None:
-        def should_cancel() -> bool:
-            return self._stop_event.is_set()
-
-        def on_progress(p: Progress) -> None:
-            self._ui_queue.put(("progress", p))
+    def _cleanup_process(self) -> None:
+        try:
+            if self._proc and self._proc.is_alive():
+                self._proc.join(timeout=0.2)
+        except Exception:
+            pass
 
         try:
-            results = search_pdfs(
-                should_cancel=should_cancel,
-                on_progress=on_progress,
-                **kwargs,
-            )
-            for m in results:
-                self._ui_queue.put(("match", m))
-            self._ui_queue.put(("done", False))
-        except Exception as e:
-            self._ui_queue.put(("error", str(e)))
-            self._ui_queue.put(("done", True))
+            if self._mp_queue is not None:
+                try:
+                    self._mp_queue.close()
+                except Exception:
+                    pass
+                try:
+                    self._mp_queue.join_thread()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        self._proc = None
+        self._mp_queue = None
+        self._cancel_event = None
 
     def _poll_queue(self) -> None:
         try:
-            while True:
-                kind, payload = self._ui_queue.get_nowait()
+            if self._mp_queue is not None:
+                while True:
+                    msg = self._mp_queue.get_nowait()
+                    mtype = msg.get("type")
 
-                if kind == "progress":
-                    p: Progress = payload
-                    if p.current_file:
-                        self.status_var.set(f"Searching: {p.current_file.name} | matches: {p.matches_found}")
-                    else:
-                        self.status_var.set("Working...")
+                    if mtype == "progress":
+                        p = msg["data"]
+                        cf = p.get("current_file")
+                        if cf:
+                            self.status_var.set(
+                                f"Searching: {Path(cf).name} | matches: {p.get('matches_found', 0)}"
+                            )
+                        else:
+                            self.status_var.set("Working...")
 
-                    if p.total > 0:
-                        self.progress.set(min(1.0, max(0.0, p.processed / p.total)))
-                    else:
-                        # unknown total, keep it moving gently
-                        self.progress.set((time.time() % 1.0))
+                        total = int(p.get("total") or 0)
+                        processed = int(p.get("processed") or 0)
+                        if total > 0:
+                            self.progress.set(min(1.0, max(0.0, processed / total)))
+                        else:
+                            self.progress.set((time.time() % 1.0))
 
-                elif kind == "match":
-                    m: Match = payload
-                    self._results.append(m)
-                    self._insert_match(m)
-                    self.count_var.set(f"{len(self._results)} matches")
+                    elif mtype == "match":
+                        d = msg["data"]
+                        match = Match(
+                            pdf_path=Path(d["pdf_path"]),
+                            page_number_1based=int(d["page_number_1based"]),
+                            snippet=str(d["snippet"]),
+                            used_ocr=bool(d.get("used_ocr", False)),
+                        )
+                        self._results.append(match)
+                        self._insert_match(match)
+                        self.count_var.set(f"{len(self._results)} matches")
 
-                elif kind == "error":
-                    messagebox.showerror("Error", payload)
+                    elif mtype == "error":
+                        messagebox.showerror("Error", msg.get("message", "Unknown error"))
 
-                elif kind == "done":
-                    _had_error = payload
-                    if self._stop_event.is_set():
-                        self.status_var.set(f"Cancelled. {len(self._results)} matches so far.")
-                    else:
-                        self.status_var.set(f"Done. {len(self._results)} matches.")
-                        self.progress.set(1.0)
-                    self._set_busy(False)
+                    elif mtype == "done":
+                        if self._cancel_event and self._cancel_event.is_set():
+                            self.status_var.set(f"Cancelled. {len(self._results)} matches so far.")
+                        else:
+                            self.status_var.set(f"Done. {len(self._results)} matches.")
+                            self.progress.set(1.0)
+
+                        self._set_busy(False)
+                        self._cleanup_process()
+                        break
 
         except queue.Empty:
             pass

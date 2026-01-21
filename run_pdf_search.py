@@ -12,6 +12,7 @@ Safe place for:
 import sys
 import traceback
 from pathlib import Path
+import multiprocessing as mp
 
 
 def _setup_logging() -> "object":
@@ -126,6 +127,13 @@ def main() -> int:
     logger = _setup_logging()
     try:
         logger.info("Launcher starting (python=%s)", sys.executable)
+    except Exception:
+        pass
+
+    # Windows-safe multiprocessing entry (also helps PyInstaller builds).
+    mp.freeze_support()
+    try:
+        mp.set_start_method("spawn", force=True)
     except Exception:
         pass
 
