@@ -15,6 +15,7 @@ from tkinter import filedialog, messagebox, ttk
 import customtkinter as ctk
 
 from pdf_search_core import Match, Progress, search_pdfs
+from pdf_search_settings import Settings, load_settings, save_settings
 
 # Shared app logger (configured by launcher; safe if it isn't)
 logger = logging.getLogger("pdf_search")
@@ -35,6 +36,21 @@ class PDFSearchApp(ctk.CTk):
         self.geometry("1150x720")
         self.minsize(980, 620)
 
+        self._settings = load_settings()
+
+        # Restore window geometry if present
+        if self._settings.window_geometry:
+            try:
+                self.geometry(self._settings.window_geometry)
+            except Exception:
+                pass
+
+        # Debounced save timer id
+        self._save_after_id = None
+
+        # Save on close
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
         self._worker: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._ui_queue: "queue.Queue[tuple]" = queue.Queue()
@@ -48,13 +64,15 @@ class PDFSearchApp(ctk.CTk):
         top = ctk.CTkFrame(self, corner_radius=16)
         top.pack(fill="x", padx=16, pady=(16, 10))
 
-        self.folder_var = tk.StringVar(value=str(Path.home()))
-        self.query_var = tk.StringVar(value="")
-        self.regex_var = tk.BooleanVar(value=False)
-        self.ignore_case_var = tk.BooleanVar(value=True)
-        self.recursive_var = tk.BooleanVar(value=True)
-        self.ocr_var = tk.BooleanVar(value=False)
-        self.ocr_dpi_var = tk.IntVar(value=200)
+        default_folder = self._settings.last_folder or str(Path.home())
+
+        self.folder_var = tk.StringVar(value=default_folder)
+        self.query_var = tk.StringVar(value="")  # usually not persisted
+        self.regex_var = tk.BooleanVar(value=bool(self._settings.regex))
+        self.ignore_case_var = tk.BooleanVar(value=bool(self._settings.ignore_case))
+        self.recursive_var = tk.BooleanVar(value=bool(self._settings.recursive))
+        self.ocr_var = tk.BooleanVar(value=bool(self._settings.ocr))
+        self.ocr_dpi_var = tk.IntVar(value=int(self._settings.ocr_dpi or 200))
 
         ctk.CTkLabel(top, text="Folder", width=60, anchor="w").grid(row=0, column=0, padx=(14, 8), pady=(14, 8), sticky="w")
         self.folder_entry = ctk.CTkEntry(top, textvariable=self.folder_var)
@@ -136,10 +154,62 @@ class PDFSearchApp(ctk.CTk):
 
         self.tree.bind("<Double-1>", lambda _e: self._open_selected_file())
 
+        # Persist settings when options change (debounced)
+        for var in (
+            self.folder_var,
+            self.regex_var,
+            self.ignore_case_var,
+            self.recursive_var,
+            self.ocr_var,
+            self.ocr_dpi_var,
+        ):
+            var.trace_add("write", lambda *_: self._schedule_save_settings())
+
     def _pick_folder(self) -> None:
         chosen = filedialog.askdirectory(initialdir=self.folder_var.get() or str(Path.home()))
         if chosen:
             self.folder_var.set(chosen)
+
+    def _schedule_save_settings(self) -> None:
+        # Debounce: only write once after user stops changing controls
+        if self._save_after_id is not None:
+            try:
+                self.after_cancel(self._save_after_id)
+            except Exception:
+                pass
+        self._save_after_id = self.after(350, self._save_settings_now)
+
+    def _save_settings_now(self) -> None:
+        self._save_after_id = None
+        self._settings.last_folder = self.folder_var.get()
+        self._settings.regex = bool(self.regex_var.get())
+        self._settings.ignore_case = bool(self.ignore_case_var.get())
+        self._settings.recursive = bool(self.recursive_var.get())
+        self._settings.ocr = bool(self.ocr_var.get())
+
+        # DPI can be temporarily invalid while typing
+        try:
+            self._settings.ocr_dpi = int(self.ocr_dpi_var.get())
+        except Exception:
+            pass
+
+        try:
+            self._settings.window_geometry = self.geometry()
+        except Exception:
+            pass
+
+        try:
+            save_settings(self._settings)
+        except Exception:
+            # Do not block the UI for settings write issues
+            pass
+
+    def _on_close(self) -> None:
+        # Save one last time with current geometry and values
+        try:
+            self._save_settings_now()
+        finally:
+            self.destroy()
 
     def _set_busy(self, busy: bool) -> None:
         self.search_btn.configure(state="disabled" if busy else "normal")
