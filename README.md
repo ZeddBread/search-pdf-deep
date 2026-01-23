@@ -33,6 +33,8 @@ PDF Search (Deep) helps you quickly find specific text or patterns across multip
   - Windows: Download from [GitHub Tesseract releases](https://github.com/UB-Mannheim/tesseract/wiki)
   - macOS: `brew install tesseract`
   - Linux: `sudo apt-get install tesseract-ocr` (Ubuntu/Debian) or equivalent
+  
+  **Note:** You need both the Tesseract system binary (above) AND the Python package `pytesseract` (installed via pip). The `pytesseract` package is just a Python wrapper—it requires the actual Tesseract OCR engine to be installed on your system. Installing only `pytesseract` via pip will result in an error if the system binary isn't present.
 
 ### Quick Start (GUI - Recommended)
 
